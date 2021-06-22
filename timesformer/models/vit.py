@@ -95,28 +95,26 @@ class Attention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
 
     def forward(self, x):
-        # x shape = [B x (spatial_tok*T+1) x emb] = [2 x 1569 x 768]
-        # divided_sp_time time-attn x shape = [B*spatial_tok x T x emb] = [392 x 8 x 768]
-        # divided_sp_time space-attn x shape = [B*spatial_tok x T x emb] = [16 x 197 x 768]
+        # space_time-attn = [B, h.w.T, emb]
+        # time-attn = [B.h.w, T, emb] = [196*2, 8, 768]
+        # space-attn = [B.T, h.w, emb] = [16, 196, 768]
         B, N, C = x.shape
         if self.with_qkv:
-            # joint space-time
-            #   qkv shape: [2 x 1569 x 768] -> [2 x 1569 x 3*768]
-            #   -> [2 x 1569 x 3 x 12 x 64] -> [3 x 2 x 12 x 1569 x 64]
-            # divided_space_time
-            #   time: qkv shape: [392 x 8 x 768] -> [392 x 8 x 3*768]
-            #   -> [392 x 8 x 3 x 12 x 64] -> [3 x 392 x 12 x 8 x 64]
-            #   space: qkv shape: [16 x 197 x 768] -> [16 x 197 x 3*768]
-            #   -> [16 x 197 x 3 x 12 x 64] -> [3 x 16 x 12 x 197 x 64]
-            qkv = (
-                self.qkv(x)
-                .reshape(B, N, 3, self.num_heads, C // self.num_heads)
-                .permute(2, 0, 3, 1, 4)
-            )
-            # q, k, v shape: [2 x 12 x 1569 x 64] for joint space-time
-            # for divided_space_time
-            #   - time q, k, v shape: [392 x 12 x 8 x 64]
-            #   - space q, k, v shape: [16 x 12 x 197 x 64]
+            # space_time = [B, h.w.T, emb] -> [B, h.w.T, 3*emb]
+            # time: [B.h.w, T, emb] -> [B.h.w, T, 3*emb] = [392, 8, 3*768]
+            qkv = self.qkv(x)
+            # space_time = [B, h.w.T, 3*emb] -> [B, h.w.T, 3, nH, C//nH]
+            # time: [B.h.w, T, 3*emb] -> [B.h.w, T, 3, nH, C//nH]
+            # space: [B.T, h.w, 3*emb] -> [B.T, h.w, 3, nH, C//nH]
+            qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads)
+            # space_time: [B, h.w.T, 3, nH, C//nH] -> [3, B, nH, h.w.T, C//nH]
+            # time: [B.h.w, T, 3, nH, C//nH] -> [3, B.h.w, nH, T, C//nH] = [3, 392, 12, 8, 64]
+            # space: [B.T, h.w, 3, nH, C//nH] -> [3, B.T, nH, h.w, C//nH] = [3, 16, 12, 196, 64]
+            qkv = qkv.permute(2, 0, 3, 1, 4)
+
+            # space_time: q, k, v: [B, nH, h.w.T, C//nH]
+            # time: q, k, v: [B.h.w, nH, T, C//nH] = [392, 12, 8, 64]
+            # space: q, k, v: shape: [B.T, nH, h.w, C//nH] = [16, 12, 196, 64]
             q, k, v = qkv[0], qkv[1], qkv[2]
             # print(f"q: {q.shape}, k: {k.shape}, v: {v.shape}")
         else:
@@ -125,22 +123,25 @@ class Attention(nn.Module):
             )
             q, k, v = qkv, qkv, qkv
 
-        # [392 x 12 x 8 x 64], [392 x 12 x 64 x 8] -> [392 x 12 x 8 x 8] for dst time.
-        # [16 x 12 x 197 x 64], [16 x 12 x 64 x 197] -> [16 x 12 x 197 x 197] for dst space.
+        # space_time: [B, nH, h.w.T, C//nH], [B, nH, C//nH, h.w.T] -> [B, nH, h.w.T, h.w.T] = [4, 12, 12*12*8, 12*12*8]
+        # time: [B.h.w, nH, T, C//nH], [B.h.w, nH, C//nH, T] -> [B.h.w, nH, T, T] = [392, 12, 8, 8]
+        # space: [B.T, nH, h.w, C//nH], [B.T, nH, C//nH, h.w] -> [B.T, nH, h.w, h.w] = [16, 12, 196, 196]
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        # -> [392 x 12 x 8 x 8] for dst time
-        # -> [16 x 12 x 197 x 197] for dst time
+        # space_time: [B, nH, h.w.T, h.w.T] = [392, 12, 8, 8]
+        # time: [B.h.w, nH, T, T] = [392, 12, 8, 8]
+        # space: [B.T, nH, h.w, h.w] = [16, 12, 196, 196]
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        # dst time: [392 x 12 x 8 x 8], [392 x 12 x 8 x 64] -> [392 x 12 x 8 x 64]
-        #           -> [392 x 8 x 12 x 64] -> [392 x 8 x 768]
-        # dst space: [16 x 12 x 197 x 197], [16 x 12 x 197 x 64] -> [16 x 12 x 197 x 64]
-        #           -> [16 x 197 x 12 x 64] -> [16 x 197 x 768]
+        # space_time: [B, nH, h.w.T, h.w.T], [B, nH, h.w.T, C//nH] -> [B, nH, h.w.T, C//nH] -> [B, h.w.T, nH, C//nH] -> [B, h.w.T, C]
+        # time: [B.h.w, nH, T, T], [B.h.w, nH, T, C//nH] -> [B.h.w, T, nH, C//nH] -> [B.h.w, T, C]
+        # space: [B, nH, h.w, h.w], [B, nH, h.w, C//nH] -> [B, h.w, nH, C//nH] -> [B, h.w, C] = [16, 196, 768]
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         if self.with_qkv:
-            # [392 x 8 x 768] -> [392 x 8 x 768] for dst time
-            # [16 x 197 x 768] -> [16 x 197 x 768] for dst time
+            # [392, 8, 768] -> [392, 8, 768] for dst time
+            # space_time: [B, h.w.T, C] -> [B, h.w.T, C] = [8, 196*8, C]
+            # time: [B.h.w, T, C] -> [B.h.w, T, C] = [8*196, 8, C]
+            # space: [B, h.w, C] -> [B, h.w, C] = [8, 196, C]
             x = self.proj(x)
             x = self.proj_drop(x)
         return x
@@ -207,7 +208,7 @@ class Block(nn.Module):
         )
 
     def forward(self, x, B, T, W):
-        # x shape: [B x (spatial_tok*T+1) x emb] = [2 x 1569 x 768]
+        # , shape: [B, (h.w.T+1), emb] = [2, 1569, 768]
         num_spatial_tokens = (x.size(1) - 1) // T  # 196
         # H, W = 14, 14
         H = num_spatial_tokens // W
@@ -218,46 +219,46 @@ class Block(nn.Module):
             return x
         elif self.attention_type == "divided_space_time":
             ## Temporal
-            # xt shape = [2 x 1568 x 768]
+            # xt shape = [2, 1568, 768]
             xt = x[:, 1:, :]
             # b, h, w, t = 2, 14, 14, 8
-            # [2 x 1568 x 768] -> [392 x 8 x 768]
+            # [2, 1568, 768] -> [392, 8, 768]
             xt = rearrange(xt, "b (h w t) m -> (b h w) t m", b=B, h=H, w=W, t=T)
-            # [392 x 8 x 768] -> [392 x 8 x 768]
+            # [392, 8, 768] -> [392, 8, 768]
             res_temporal = self.drop_path(self.temporal_attn(self.temporal_norm1(xt)))
-            # [392 x 8 x 768] -> [2 x 1568 x 768]
+            # [392, 8, 768] -> [2, 1568, 768]
             res_temporal = rearrange(
                 res_temporal, "(b h w) t m -> b (h w t) m", b=B, h=H, w=W, t=T
             )
-            # [2 x 1568 x 768] -> [2 x 1568 x 768]
+            # [2, 1568, 768] -> [2, 1568, 768]
             res_temporal = self.temporal_fc(res_temporal)
             xt = x[:, 1:, :] + res_temporal
 
             ## Spatial
-            # init_cls_token shape: [2 x 1 x 768]
+            # init_cls_token shape: [2, 1, 768]
             init_cls_token = x[:, 0, :].unsqueeze(1)
-            # cls_token -> [2 x 8 x 768]
+            # cls_token -> [2, 8, 768]
             cls_token = init_cls_token.repeat(1, T, 1)
-            # [2 x 8 x 768] -> [16 x 768] -> [16 x 1 x 768]
+            # [2, 8, 768] -> [16, 768] -> [16, 1, 768]
             cls_token = rearrange(cls_token, "b t m -> (b t) m", b=B, t=T).unsqueeze(1)
             xs = xt
-            # [2 x 1568 x 768] -> [16 x 196 x 768]
+            # [2, 1568, 768] -> [16, 196, 768]
             xs = rearrange(xs, "b (h w t) m -> (b t) (h w) m", b=B, h=H, w=W, t=T)
-            # [16 x 196 x 768], [16 x 1 x 768] -> [16 x 197 x 768]
+            # [16, 196, 768], [16, 1, 768] -> [16, 196, 768]
             xs = torch.cat((cls_token, xs), 1)
-            # [16 x 197 x 768] -> [16 x 197 x 768]
+            # [16, 196, 768] -> [16, 196, 768]
             res_spatial = self.drop_path(self.attn(self.norm1(xs)))
 
             ### Taking care of CLS token
-            # -> [16 x 768]
+            # -> [16, 768]
             cls_token = res_spatial[:, 0, :]
-            # [16 x 768] -> [2 x 8 x 768]
+            # [16, 768] -> [2, 8, 768]
             cls_token = rearrange(cls_token, "(b t) m -> b t m", b=B, t=T)
-            # [2 x 8 x 768] -> [2 x 1 x 768]
+            # [2, 8, 768] -> [2, 1, 768]
             cls_token = torch.mean(cls_token, 1, True)  ## averaging for every frame
-            # -> [16 x 196 x 768]
+            # -> [16, 196, 768]
             res_spatial = res_spatial[:, 1:, :]
-            # [16 x 196 x 768] -> [2 x 1568 x 768]
+            # [16, 196, 768] -> [2, 1568, 768]
             res_spatial = rearrange(
                 res_spatial, "(b t) (h w) m -> b (h w t) m", b=B, h=H, w=W, t=T
             )
@@ -265,8 +266,12 @@ class Block(nn.Module):
             x = xt
 
             ## Mlp
+            # cat([2, 1, 768], [2, 1568, 768]) + cat([2, 1, 768], [2, 1568, 768])
+            #   -> [2, 1569, 768] + [2, 1569, 768]
             x = torch.cat((init_cls_token, x), 1) + torch.cat((cls_token, res), 1)
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
+            # [2, 1569, 768] -> [2, 1569, 768]
+            res_comp = self.drop_path(self.mlp(self.norm2(x)))
+            x = x + res_comp
             return x
 
 
@@ -289,13 +294,12 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         B, C, T, H, W = x.shape
-        # [2 x 3 x 8 x 224 x 224] -> [16 x 3 x 224 x 224]
+        # [2, 3, 8, 224, 224] -> [16, 3, 224, 224]
         x = rearrange(x, "b c t h w -> (b t) c h w")
-        # [16 x 3 x 224 x 224] -> [16 x embed_dim x 14 x 14]
+        # [16, 3, 224, 224] -> [16, embed_dim, 14, 14]
         x = self.proj(x)
         W = x.size(-1)
-        # [16 x embed_dim x 14 x 14] -> [16 x embed_dim x 196] ->
-        # [16 x 196 x 768]
+        # [16, embed_dim, 14, 14] -> [16, emb, 196] -> [16, 196, 768]
         x = x.flatten(2).transpose(1, 2)
         print(f"PatchEmbed x shape: {x.shape}")
         return x, T, W
@@ -342,13 +346,13 @@ class VisionTransformer(nn.Module):
         num_patches = self.patch_embed.num_patches
 
         ## Positional Embeddings
-        # [1 x 1 x 768]
+        # [1, 1, 768]
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        # [1 x 197 x 768]
+        # [1, 196, 768]
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
         if self.attention_type != "space_only":
-            # 1 x 8 x 768
+            # 1, 8, 768
             self.time_embed = nn.Parameter(torch.zeros(1, num_frames, embed_dim))
             self.time_drop = nn.Dropout(p=drop_rate)
 
@@ -418,22 +422,22 @@ class VisionTransformer(nn.Module):
         )
 
     def forward_features(self, x):
-        # x shape: [B x C x T x H x w] = [2, 3, 8, 224, 224]
+        # , shape: [B, C, T, H, w] = [2, 3, 8, 224, 224]
         B = x.shape[0]
-        # [2 x 3 x 8 x 224 x 224] -> [16 x 196 x 768]
+        # [2, 3, 8, 224, 224] -> [16, 196, 768]
         # time and batch merged.
         x, T, W = self.patch_embed(x)
-        # [1 x 1 x 768] -> [16 x 1 x 768]
+        # [1, 1, 768] -> [16, 1, 768]
         cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
-        # [16 x 196 x 768], [16 x 1 x 768] -> [16 x 197 x 768]
+        # [16, 1, 768], [16, 196, 768] -> [16, 196, 768]
         x = torch.cat((cls_tokens, x), dim=1)
 
         ## resizing the positional embeddings in case they don't match the input at inference.
-        # pos_embed shape: [1 x 197 x 768]
+        # pos_embed shape: [1, 196, 768]
         if x.size(1) != self.pos_embed.size(1):
-            # say pos_embed shape: [1 x seq_len x 768]
+            # say pos_embed shape: [1, seq_len, 768]
             pos_embed = self.pos_embed
-            # cls_pos_embed shape: [1 x 1 x 1 x 0 x 768]
+            # cls_pos_embed shape: [1, 1, 1, 0, 768]
             cls_pos_embed = pos_embed[0, 0, :].unsqueeze(0).unsqueeze(1)
             other_pos_embed = pos_embed[0, 1:, :].unsqueeze(0).transpose(1, 2)
             P = int(other_pos_embed.size(2) ** 0.5)
@@ -445,43 +449,44 @@ class VisionTransformer(nn.Module):
             new_pos_embed = torch.cat((cls_pos_embed, new_pos_embed), 1)
             x = x + new_pos_embed
         else:
-            # [16 x 197 x 768], [1 x 197 x 768] -> [16 x 197 x 768]
+            # [16, 196, 768], [1, 196, 768] -> [16, 196, 768]
             x = x + self.pos_embed
-        # -> [16 x 197 x 768]
+        # -> [16, 196, 768]
         x = self.pos_drop(x)
 
         ## Time Embeddings
         if self.attention_type != "space_only":
-            # cls_tokens: [2 x 768] -> [2 x 1 x 768]
+            # cls_tokens: [2, 768] -> [2, 1, 768]
             cls_tokens = x[:B, 0, :].unsqueeze(1)
-            # [16 x 197 x 768] -> [16 x 196 x 768]
+            # [16, 196, 768] -> [16, 196, 768]
             x = x[:, 1:]
             # b, t, n, m = 2, 8, 196, 768
-            # [16 x 196 x 768] -> [392 x 8 x 768] = [B*patch_len x T x emb_dim]
+            # [16, 196, 768] -> [392, 8, 768] = [B*patch_len, T, emb_dim]
             x = rearrange(x, "(b t) n m -> (b n) t m", b=B, t=T)
-            print(f"x shape after rearrange: {x.shape}")
+            # print(f"x shape after rearrange: {x.shape}")
             ## Resizing time embeddings in case they don't match
-            # self.time_embed shape: 1 x 8 x 768
+            # self.time_embed shape: 1, 8, 768
             if T != self.time_embed.size(1):
                 time_embed = self.time_embed.transpose(1, 2)
                 new_time_embed = F.interpolate(time_embed, size=(T), mode="nearest")
                 new_time_embed = new_time_embed.transpose(1, 2)
                 x = x + new_time_embed
             else:
-                # [B*patch_len x T x emb_dim], [1 x T x emb_dim] ->
-                # [B*patch_len x T x emb_dim] = [392 x 8 x 768]
+                # [B*patch_len, T, emb_dim], [1, T, emb_dim] ->
+                # [B*patch_len, T, emb_dim] = [392, 8, 768]
                 x = x + self.time_embed
             x = self.time_drop(x)
-            # [B*patch_len x T x emb_dim] -> [B, patch_len*T, emb_dim]
+            # [B*patch_len, T, emb_dim] -> [B, patch_len*T, emb_dim]
             # [2*196, 8, 768] -> [2, 196*8, 768]
             x = rearrange(x, "(b n) t m -> b (n t) m", b=B, t=T)
-            # [2, 196*8, 768], [2, 1, 768] -> [2, 1569, 768]
+            # [2, 1, 768], [2, 196*8, 768] -> [2, 1569, 768]
             x = torch.cat((cls_tokens, x), dim=1)
-            print(f"x shape after cat: {x.shape}")
 
         ## Attention blocks
+        # [2, 1569, 768] -> [2, 1569, 768]
         for blk in self.blocks:
             x = blk(x, B, T, W)
+        print(f"x out shape from Block: {x.shape}")
 
         ### Predictions for space-only baseline
         if self.attention_type == "space_only":
@@ -489,16 +494,19 @@ class VisionTransformer(nn.Module):
             x = torch.mean(x, 1)  # averaging predictions for every frame
 
         x = self.norm(x)
+        # cls_tokens is at index=0.
         return x[:, 0]
 
     def forward(self, x):
+        # [B, C, T, H, w] -> [B, emb] = [2, 3, 8, 224, 224] -> [2, 768]
         x = self.forward_features(x)
+        # [B, emb] -> [B, num_classes]
         x = self.head(x)
         return x
 
 
 def _conv_filter(state_dict, patch_size=16):
-    """ convert patch embedding weight from manual patchify + linear proj to conv"""
+    """convert patch embedding weight from manual patchify + linear proj to conv"""
     out_dict = {}
     for k, v in state_dict.items():
         if "patch_embed.proj.weight" in k:
